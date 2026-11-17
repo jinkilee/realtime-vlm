@@ -202,8 +202,10 @@ async def upload(file: UploadFile = File(...)):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _chown_like_workspace(UPLOAD_DIR)
     dest = UPLOAD_DIR / name
-    if dest.exists():
-        dest = UPLOAD_DIR / f"{dest.stem}_{int(time.time())}{dest.suffix}"
+    stem, suffix, n = dest.stem, dest.suffix, 1
+    while dest.exists():  # never overwrite: name_1.mp4, name_2.mp4, ...
+        dest = UPLOAD_DIR / f"{stem}_{n}{suffix}"
+        n += 1
     with open(dest, "wb") as f:
         while chunk := await file.read(1 << 20):
             f.write(chunk)
