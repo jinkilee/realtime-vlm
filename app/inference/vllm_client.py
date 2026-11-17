@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 import httpx
 import numpy as np
@@ -85,7 +86,10 @@ class VLLMClient:
 
     # ---- public -----------------------------------------------------------------------
     def infer(self, frames_bgr: list[np.ndarray], query: str, window_sec: float | None = None,
-              strategy: str | None = None) -> InferResult:
+              strategy: str | None = None,
+              on_judge: Callable[[float, bool, float], None] | None = None) -> InferResult:
+        """on_judge(score, detected, elapsed_ms): two_stage only, called right after the judge,
+        before grounding, so callers can alert without waiting for the boxes."""
         inf = self.cfg["inference"]
         window = inf["window_sec"] if window_sec is None else window_sec
         strategy = strategy or inf.get("strategy", "multi_image")
@@ -105,7 +109,10 @@ class VLLMClient:
             usage = data.get("usage", {})
             raw = f"judge P(yes)={score:.3f}"
             boxes = []
-            if score >= inf.get("judge_threshold", 0.5):
+            judged = score >= inf.get("judge_threshold", 0.5)
+            if on_judge:
+                on_judge(score, judged, (time.perf_counter() - t0) * 1000)
+            if judged:
                 boxes, graw, gusage = self._ground(frames_bgr[-1:], query, window)
                 raw += f" | ground: {graw}"
                 usage = _add_usage(usage, gusage)
@@ -114,7 +121,9 @@ class VLLMClient:
 
         h, w = preprocess.resize_long_edge(frames_bgr[-1], self.cfg["preprocess"]["max_side"]).shape[:2]
         answered_boxes = "bbox_2d" in raw
+        # two_stage: the judge decides (boxes may be missing if grounding fails); others: any box
+        detected = score >= inf.get("judge_threshold", 0.5) if score is not None else bool(boxes)
         return InferResult(
             boxes=boxes, raw=raw, latency_ms=latency, usage=usage, image_size=(w, h), score=score,
-            detected=bool(boxes), calls=calls, parse_error=answered_boxes and not boxes,
+            detected=detected, calls=calls, parse_error=answered_boxes and not boxes,
         )

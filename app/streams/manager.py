@@ -47,11 +47,13 @@ class Stream:
 
 
 class StreamManager:
-    def __init__(self, cfg: dict, root: Path, server_url: str, publish: Callable[[dict], None]):
+    def __init__(self, cfg: dict, root: Path, server_url: str, publish: Callable[[dict], None],
+                 events=None):
         self.cfg = cfg
         self.root = root.resolve()
         self.server_url = server_url
         self.publish = publish
+        self.events = events  # EventStore | None
         self.streams: dict[str, Stream] = {}
         self._lock = threading.Lock()
 
@@ -93,10 +95,16 @@ class StreamManager:
                 raise StreamError(409, f"max {self.cfg['stream']['max_streams']} streams")
             sid = uuid.uuid4().hex[:8]
             stc, pp = self.cfg["stream"], self.cfg["preprocess"]
-            source = FrameSource(url, path, pp["max_side"], stc["buffer_fps"], stc["buffer_sec"],
+            source = FrameSource(url, path, stc["buffer_max_side"], stc["buffer_fps"], stc["buffer_sec"],
                                  stc["reconnect_max_sec"])
-            worker = InferenceWorker(sid, source, settings, self.cfg, self.server_url, self.publish)
-            stream = Stream(sid, name or Path(url).name or url, url, time.time(), source, worker)
+            stream_name = name or Path(url).name or url
+            on_det = None
+            if self.events is not None:
+                def on_det(prompt, ts, score, boxes, frame, _sid=sid):
+                    st = self.streams.get(_sid)
+                    self.events.on_detection(_sid, st.name if st else stream_name, prompt, ts, score, boxes, frame)
+            worker = InferenceWorker(sid, source, settings, self.cfg, self.server_url, self.publish, on_det)
+            stream = Stream(sid, stream_name, url, time.time(), source, worker)
             self.streams[sid] = stream
         source.start()
         worker.start()
