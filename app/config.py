@@ -31,6 +31,8 @@ def load(path: Path | str = CONFIG_PATH) -> dict:
     mid = cfg["serving"]["model_id"]
     if not Path(mid).is_absolute() and (ROOT / mid).exists():
         cfg["serving"]["model_id"] = str(ROOT / mid)
+    if cfg["inference"]["window_sec"] > cfg["stream"]["buffer_sec"]:
+        raise ValueError("inference.window_sec must be <= stream.buffer_sec")
     if cfg["inference"]["num_frames"] > cfg["serving"]["max_images_per_request"]:
         raise ValueError("inference.num_frames must be <= serving.max_images_per_request")
     return cfg
@@ -50,9 +52,11 @@ def shell_exports(cfg: dict) -> str:
         "SERVED_MODEL_NAME": s["served_model_name"],
         "SERVING_PORT": s["port"],
         "APP_PORT": cfg["app"]["port"],
+        "APP_RELOAD": "1" if cfg["app"].get("reload") else "0",
         "GPU_MEM_UTIL": s["gpu_memory_utilization"],
         "MAX_MODEL_LEN": s["max_model_len"],
         "MAX_NUM_SEQS": s["max_num_seqs"],
+        "SCHEDULING_POLICY": s.get("scheduling_policy", "fcfs"),
         "LIMIT_MM_PER_PROMPT": json.dumps(
             {"image": {"count": s["max_images_per_request"], "width": max_side, "height": max_side},
              "video": 0}),
