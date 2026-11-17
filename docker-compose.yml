@@ -1,0 +1,73 @@
+# realtime-vlm: serving (vLLM, GPU) <- backend (FastAPI) <- frontend (Vite dev server)
+# Source code is mounted (not baked into images): rebuild only when dependencies change.
+#   sh build_docker.sh   -> docker compose build
+#   sh run_docker.sh     -> docker compose up -d
+# UI: http://127.0.0.1:8000   API docs: http://127.0.0.1:8001/docs   vLLM: http://127.0.0.1:9000
+name: realtime-vlm
+
+services:
+  serving:
+    build: ./serving
+    image: realtime-vlm-serving:latest
+    container_name: realtime-vlm-serving
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - SERVING        # optional overrides from the host shell (vllm | triton)
+      - MODEL_ID
+    volumes:
+      - ./serving:/workspace/serving:ro
+      - ./configs:/workspace/configs:ro
+      - ./model_files:/workspace/model_files:ro
+    ports:
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 600s   # model load + torch.compile + CUDA graph capture
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    image: realtime-vlm-backend:latest
+    container_name: realtime-vlm-backend
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"   # files in data/, videos/uploads/ owned by the host user
+    volumes:
+      - ./backend:/workspace/backend
+      - ./configs:/workspace/configs:ro
+      - ./videos:/workspace/videos
+      - ./data:/workspace/data
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      serving:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    image: realtime-vlm-frontend:latest
+    container_name: realtime-vlm-frontend
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules   # keep the image's node_modules (not the host's)
+    ports:
+      - "127.0.0.1:8000:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+networks:
+  default:
+    name: realtime-vlm

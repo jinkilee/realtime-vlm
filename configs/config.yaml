@@ -1,4 +1,4 @@
-# realtime-vlm configuration (single source of truth for serving + app + examples)
+# realtime-vlm configuration (single source of truth for serving + backend + examples)
 # Env overrides: SERVING -> serving.backend, MODEL_ID -> serving.model_id
 
 serving:
@@ -11,6 +11,7 @@ serving:
   model_id: model_files/Qwen3-VL-4B-Instruct-FP8
   offline: true                     # HF_HUB_OFFLINE=1: never download / contact the hub
   served_model_name: vlm
+  host: serving                     # docker-compose service name (backend -> serving)
   port: 9000
   gpu_memory_utilization: 0.85      # 4B-FP8 weights take 5.85 GiB; Windows keeps ~1 GiB of the 8 GiB
   max_model_len: 2048               # KV cache ~3.2k tokens total; one 4-frame request is ~0.5k tokens
@@ -63,6 +64,6 @@ events:
   cooldown_sec: 5.0                 # detections within this gap on the same stream merge into one event
   max_in_memory: 500
 
-app:
-  port: 8000
-  reload: true                      # uvicorn --reload on app/ changes (dev; code is volume-mounted)
+backend:
+  port: 8000                        # inside the compose network (published as 127.0.0.1:8001)
+  reload: true                      # uvicorn --reload on backend/app or configs/ changes (dev; source is mounted)

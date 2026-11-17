@@ -1,1 +1,1 @@
-docker build -t realtime-vlm:latest .
+docker compose build

@@ -1,6 +1,6 @@
 """Compare inference strategies on labeled videos (detection + localization + latency).
 
-  python3 examples/eval_strategies.py --labels examples/eval/urfd_fall.yaml \
+  python3 backend/examples/eval_strategies.py --labels backend/examples/eval/urfd_fall.yaml \
       --strategies multi_image two_stage single_frame --step 0.25
 
 Detection is scored per timestamp (prediction = at least one box). Localization: IoU of the best
@@ -39,7 +39,7 @@ def iou(a, b) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--labels", default="examples/eval/urfd_fall.yaml")
+    ap.add_argument("--labels", default="backend/examples/eval/urfd_fall.yaml")
     ap.add_argument("--strategies", nargs="+", default=["multi_image", "two_stage", "single_frame"])
     ap.add_argument("--step", type=float, default=0.25)
     ap.add_argument("--start", type=float, default=0.5, help="first timestamp (s)")

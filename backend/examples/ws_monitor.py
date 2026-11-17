@@ -1,6 +1,6 @@
 """Watch /ws for N seconds and print per-stream stats (results, detection rate, latency, state changes).
 
-  docker exec -it realtime-vlm python3 examples/ws_monitor.py --sec 20
+  docker exec -it realtime-vlm-backend python3 examples/ws_monitor.py --sec 20
 """
 from __future__ import annotations
 
