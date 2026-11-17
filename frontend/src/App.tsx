@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
-import AddStreamBar from "./components/AddStreamBar";
+import AddStreamForm from "./components/AddStreamForm";
 import EventPanel from "./components/EventPanel";
 import StreamTile from "./components/StreamTile";
 import type { Health } from "./types";
@@ -10,6 +10,7 @@ export default function App() {
   const { connected, streams, live, events, lastError, upsertStream, dropStream } = useLive();
   const [health, setHealth] = useState<Health | null>(null);
   const [now, setNow] = useState(() => performance.now());
+  const [addingSlot, setAddingSlot] = useState<number | null>(null);
 
   // re-render 4x/s so box fade-out and alert expiry happen without new messages
   useEffect(() => {
@@ -45,7 +46,7 @@ export default function App() {
       </header>
 
       <main>
-        <AddStreamBar count={streams.length} max={max} onAdded={upsertStream} />
+        <AddStreamForm variant="bar" count={streams.length} max={max} onAdded={upsertStream} />
         <section className="grid">
           {slots.map((s, i) =>
             s ? (
@@ -58,10 +59,21 @@ export default function App() {
                 onChanged={upsertStream}
                 onRemoved={dropStream}
               />
-            ) : (
-              <div key={`empty-${i}`} className="tile empty">
-                <span className="muted">빈 슬롯 {i + 1}</span>
+            ) : addingSlot === i ? (
+              <div key={`empty-${i}`} className="tile empty adding">
+                <AddStreamForm
+                  variant="slot"
+                  count={streams.length}
+                  max={max}
+                  onAdded={upsertStream}
+                  onDone={() => setAddingSlot(null)}
+                />
               </div>
+            ) : (
+              <button key={`empty-${i}`} className="tile empty clickable" onClick={() => setAddingSlot(i)}>
+                <span className="plus">＋</span>
+                <span className="muted">빈 슬롯 {i + 1} — 클릭해서 추가</span>
+              </button>
             ),
           )}
         </section>
