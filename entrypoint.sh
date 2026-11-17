@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# 1) start the serving backend (vllm | triton)  2) wait until healthy  3) start the app
+# 1) load configs/config.yaml  2) start the serving backend  3) wait until healthy  4) start the app
 set -euo pipefail
 cd /workspace
 
 log() { echo "[entrypoint] $*"; }
 
+eval "$(python3 -m app.config shell)"
+log "config: SERVING=${SERVING} MODEL_ID=${MODEL_ID} mm_processor_kwargs=${MM_PROCESSOR_KWARGS}"
+
 case "${SERVING}" in
-  vllm)   ./serving/vllm.sh & ;;
+  vllm)   bash serving/vllm.sh & ;;
   triton) log "SERVING=triton is not implemented yet (planned for P6)"; exit 1 ;;
   *)      log "unknown SERVING=${SERVING} (expected vllm|triton)"; exit 1 ;;
 esac
@@ -24,7 +27,7 @@ log "${SERVING} is ready: model=${MODEL_ID} served-as=${SERVED_MODEL_NAME}"
 
 if [[ -f app/main.py ]]; then
   log "starting app on :${APP_PORT}"
-  python -m uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT}" &
+  python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT}" &
   APP_PID=$!
   trap 'kill -TERM ${APP_PID} ${SERVING_PID} 2>/dev/null; wait' INT TERM
   wait -n "${APP_PID}" "${SERVING_PID}"
