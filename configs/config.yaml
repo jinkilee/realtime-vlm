@@ -3,7 +3,10 @@
 
 serving:
   backend: vllm                     # vllm | triton (triton: P6)
-  model_id: Qwen/Qwen3-VL-2B-Instruct
+  # Local model directory (plain files, no HF cache layout). Relative paths are resolved
+  # from the project root (/workspace in the container). A HF repo id also works if offline=false.
+  model_id: model_files/Qwen3-VL-2B-Instruct
+  offline: true                     # HF_HUB_OFFLINE=1: never download / contact the hub
   served_model_name: vlm
   port: 9000
   gpu_memory_utilization: 0.78
