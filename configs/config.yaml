@@ -1,0 +1,34 @@
+# realtime-vlm configuration (single source of truth for serving + app + examples)
+# Env overrides: SERVING -> serving.backend, MODEL_ID -> serving.model_id
+
+serving:
+  backend: vllm                     # vllm | triton (triton: P6)
+  model_id: Qwen/Qwen3-VL-2B-Instruct
+  served_model_name: vlm
+  port: 9000
+  gpu_memory_utilization: 0.78
+  max_model_len: 8192
+  max_num_seqs: 4
+  max_images_per_request: 4         # upper bound of inference.num_frames
+  extra_args: ""                    # appended to `vllm serve` as-is
+
+preprocess:
+  # Long edge (px) each frame is resized to before being sent to the server.
+  # The same value is used on the server side:
+  #   - vLLM memory profiling size (max_side x max_side)
+  #   - hard cap on image pixels (max_side^2) in the HF image processor,
+  #     so an oversized image can never exceed the profiled budget.
+  # Image tokens ~= (h/32) * (w/32): 448x252 -> ~112 tokens per frame.
+  # Changing this requires a container restart (server-side values).
+  max_side: 448
+  jpeg_quality: 85
+
+inference:
+  num_frames: 4                     # frames per request (1 = single frame)
+  window_sec: 2.0                   # time span the frames are sampled from
+  max_tokens: 512
+  temperature: 0.0
+  timeout_sec: 30
+
+app:
+  port: 8000
