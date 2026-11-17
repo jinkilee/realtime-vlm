@@ -1,6 +1,6 @@
 """Test inference against the running VLM server (same preprocess/prompt/parser as the app).
 
-Examples (run through examples/run_vlm_inference.sh, paths relative to the project root):
+Examples (run through backend/examples/run_vlm_inference.sh, paths relative to the project root):
   # images given in time order (last one is the target frame)
   run_vlm_inference.sh --image a.jpg b.jpg c.jpg d.jpg --prompt "넘어지는 사람"
   # N frames sampled from the window ending at --at seconds

@@ -217,16 +217,48 @@ realtime-vlm/
 | P0 Docker + vLLM 서빙 | 완료 | d93a4a9 |
 | P1 추론 방식/모델 평가 | 완료 (4B-FP8, two_stage) | a330ccc |
 | P2 스트림/worker/API | 완료 | a266168 |
-| P3 이벤트 로그 | 완료 | (P3+P4 커밋) |
-| P4-UI frontend | 완료 | (P3+P4 커밋) |
+| P3 이벤트 로그 | 완료 | 4ea0d5f |
+| P4-UI frontend | 완료 | 4ea0d5f |
+| 구조 개편 (컨테이너 3개) | 완료 | (이번 커밋) |
 | P5 안정화/튜닝 | 예정 | |
 | P6 Triton 비교 | 예정 | |
 
-변경된 실행 방법 (코드는 이미지에 넣지 않고 볼륨 마운트):
-```bash
-sh build_docker.sh          # 의존성 이미지 (requirements.txt 바뀔 때만)
-sh frontend/build.sh        # frontend/dist 빌드 (node:22-slim 컨테이너, frontend 바뀔 때만)
-sh run_docker.sh            # vLLM 기동 → app 기동, http://127.0.0.1:8000
+## 12. 컨테이너 구조 (2026-11-18 변경)
+
+컨테이너 3개, 소스 코드는 이미지에 넣지 않고 볼륨으로 마운트한다(수정할 때마다 docker build 하지 않기 위해).
+
 ```
-- 스트림 목록은 메모리에만 있다. app이 재시작(코드 수정 시 자동 reload 포함)되면 스트림은 사라지고, 이벤트는 `data/events/`에 남는다.
+realtime-vlm/
+├── docker-compose.yml
+├── build_docker.sh          # docker compose build (의존성 바뀔 때만)
+├── run_docker.sh            # docker compose up -d
+├── configs/config.yaml      # serving·backend 공유
+├── serving/   Dockerfile, entrypoint.sh, gen_env.py, vllm.sh, (triton/ P6)
+├── backend/   Dockerfile, requirements.txt, start.sh, app/, examples/
+├── frontend/  Dockerfile, package.json, src/, vite.config.ts
+├── tools/rtsp_sim.sh        # 테스트용 RTSP 카메라 (compose 네트워크)
+└── model_files/ videos/ data/
+```
+
+| 컨테이너 | 이미지 | 마운트 | 포트 (127.0.0.1) | 코드 수정 시 |
+|---|---|---|---|---|
+| realtime-vlm-serving | vllm/vllm-openai v0.33.0 | serving/, configs/, model_files/ (읽기 전용) | 9000 | 컨테이너 재시작 (모델 로드 1~2분) |
+| realtime-vlm-backend | python:3.12-slim + ffmpeg | backend/, configs/, videos/, data/ | 8001 (API, /docs) | uvicorn 자동 재시작 |
+| realtime-vlm-frontend | node:22-slim (Vite 개발 서버) | frontend/ (node_modules는 이미지) | **8000 (UI)** | HMR로 즉시 반영 |
+
+- backend는 serving이 healthy가 된 뒤에 시작한다(compose healthcheck). backend → serving 주소는 `http://serving:9000`.
+- frontend(Vite)가 `/api`, `/ws`, `/event-files`를 backend로 프록시한다.
+- backend·frontend는 호스트 UID로 실행되어 `data/`, `videos/uploads/` 파일이 사용자 소유가 된다.
+- 모든 이미지에 vim, net-tools, alias(`old`, `fn`, `wd`, `vi`), vimrc 설정이 들어 있다(`/etc/bash.bashrc`, `/etc/vim/vimrc.local`).
+- 스트림 목록은 메모리에만 있다. backend가 재시작되면 스트림은 사라지고, 이벤트는 `data/events/`에 남는다.
 - 실시간 박스는 추론에 쓴 프레임 기준이라 움직이는 대상에서는 약 1초 뒤처져 보인다. 이벤트 스냅샷은 같은 프레임에 그리므로 정확하다.
+
+자주 쓰는 명령:
+```bash
+sh build_docker.sh && sh run_docker.sh                       # 빌드 + 실행 → http://127.0.0.1:8000
+docker compose logs -f backend                               # 로그
+docker compose restart serving                               # config의 serving 값 변경 후
+sh tools/rtsp_sim.sh videos/samples/urfd-fall-01-rgb.mp4 cam1  # UI에 rtsp://rtsp-sim:8554/cam1 입력
+sh backend/examples/run_vlm_inference.sh --video videos/samples/urfd-fall-01-rgb.mp4 --at 4 --prompt "넘어지는 사람"
+docker exec realtime-vlm-backend python3 examples/ws_monitor.py --sec 20
+```

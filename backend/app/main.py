@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 import httpx
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import config
@@ -32,7 +32,6 @@ UPLOAD_DIR = VIDEO_DIR / "uploads"
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts"}
 SERVING_URL = config.serving_url(CFG)
 EVENT_DIR = ROOT / CFG["events"]["dir"]
-FRONTEND_DIST = ROOT / "frontend" / "dist"
 
 
 # ---- WebSocket fan-out (thread-safe publish from worker threads) ---------------------------
@@ -243,11 +242,7 @@ async def ws(websocket: WebSocket):
         hub.clients.discard(q)
 
 
-# ---- frontend (built by frontend/build.sh) — mounted last so /api, /ws, /docs win -------------
-if (FRONTEND_DIST / "index.html").exists():
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
-else:
-    @app.get("/", response_class=HTMLResponse)
-    def index():
-        return ("<h3>realtime-vlm</h3><p>frontend not built yet: run <code>sh frontend/build.sh</code> "
-                "on the host, then reload.</p><p>API docs: <a href='/docs'>/docs</a></p>")
+@app.get("/")
+def index():
+    # the UI is served by the frontend container (http://127.0.0.1:8000); this is the API only
+    return RedirectResponse("/docs")

@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 httpx
-av
+websockets
 opencv-python-headless
 numpy
 pyyaml
