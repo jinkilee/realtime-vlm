@@ -28,6 +28,9 @@ def load(path: Path | str = CONFIG_PATH) -> dict:
     for env, (section, key) in ENV_OVERRIDES.items():
         if os.environ.get(env):
             cfg[section][key] = os.environ[env]
+    mid = cfg["serving"]["model_id"]
+    if not Path(mid).is_absolute() and (ROOT / mid).exists():
+        cfg["serving"]["model_id"] = str(ROOT / mid)
     if cfg["inference"]["num_frames"] > cfg["serving"]["max_images_per_request"]:
         raise ValueError("inference.num_frames must be <= serving.max_images_per_request")
     return cfg
@@ -56,6 +59,7 @@ def shell_exports(cfg: dict) -> str:
         # HF Qwen2/3-VL image processor: size.longest_edge / shortest_edge are pixel counts
         "MM_PROCESSOR_KWARGS": json.dumps(
             {"size": {"longest_edge": max_pixels, "shortest_edge": min(65536, max_pixels)}}),
+        "HF_HUB_OFFLINE": "1" if s.get("offline") else "0",
         "VLLM_EXTRA_ARGS": s.get("extra_args") or "",
     }
     return "\n".join(f"export {k}={shlex.quote(str(v))}" for k, v in env.items())
