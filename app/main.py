@@ -13,10 +13,12 @@ from pathlib import Path
 import cv2
 import httpx
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from app import config
 from app.inference.preprocess import resize_long_edge
+from app.events.store import EventStore
 from app.schemas import StreamCreate, StreamUpdate
 from app.streams.manager import StreamError, StreamManager
 
@@ -29,6 +31,8 @@ VIDEO_DIR = ROOT / "videos"
 UPLOAD_DIR = VIDEO_DIR / "uploads"
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts"}
 SERVING_URL = config.serving_url(CFG)
+EVENT_DIR = ROOT / CFG["events"]["dir"]
+FRONTEND_DIST = ROOT / "frontend" / "dist"
 
 
 # ---- WebSocket fan-out (thread-safe publish from worker threads) ---------------------------
@@ -54,7 +58,8 @@ class Hub:
 
 
 hub = Hub()
-manager = StreamManager(CFG, ROOT, SERVING_URL, hub.publish)
+events = EventStore(EVENT_DIR, CFG["events"]["cooldown_sec"], CFG["events"]["max_in_memory"], ROOT, hub.publish)
+manager = StreamManager(CFG, ROOT, SERVING_URL, hub.publish, events)
 
 
 def _chown_like_workspace(path: Path) -> None:
@@ -207,6 +212,20 @@ async def upload(file: UploadFile = File(...)):
     return {"path": str(dest.relative_to(ROOT)), "size": dest.stat().st_size}
 
 
+# ---- events ---------------------------------------------------------------------------------
+@app.get("/api/events")
+def list_events(stream_id: str | None = None, limit: int = Query(100, ge=1, le=1000)):
+    return events.list(stream_id, limit)
+
+
+@app.delete("/api/events")
+def clear_events():
+    return {"deleted": events.clear()}
+
+
+app.mount("/event-files", StaticFiles(directory=EVENT_DIR), name="event-files")
+
+
 # ---- websocket ------------------------------------------------------------------------------
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
@@ -224,6 +243,11 @@ async def ws(websocket: WebSocket):
         hub.clients.discard(q)
 
 
-@app.get("/")
-def index():
-    return RedirectResponse("/docs")  # replaced by the frontend in P4
+# ---- frontend (built by frontend/build.sh) — mounted last so /api, /ws, /docs win -------------
+if (FRONTEND_DIST / "index.html").exists():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    @app.get("/", response_class=HTMLResponse)
+    def index():
+        return ("<h3>realtime-vlm</h3><p>frontend not built yet: run <code>sh frontend/build.sh</code> "
+                "on the host, then reload.</p><p>API docs: <a href='/docs'>/docs</a></p>")

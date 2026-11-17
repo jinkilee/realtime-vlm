@@ -38,8 +38,11 @@ class LastResult:
 
 class InferenceWorker:
     def __init__(self, stream_id: str, source: FrameSource, settings: StreamSettings, cfg: dict,
-                 server_url: str, publish: Callable[[dict], None]):
+                 server_url: str, publish: Callable[[dict], None],
+                 on_detection: Callable[..., None] | None = None):
+        """on_detection(prompt, frame_ts, score, boxes, frame) is called for every detected result."""
         self.stream_id = stream_id
+        self.on_detection = on_detection
         self.source = source
         self.settings = settings
         self.cfg = copy.deepcopy(cfg)
@@ -77,8 +80,13 @@ class InferenceWorker:
             frames, times = sampled
             last_ts = times[-1]
             self.cfg["inference"]["judge_threshold"] = s.judge_threshold
+            def on_judge(score: float, detected: bool, elapsed_ms: float, _ts=last_ts, _p=s.prompt) -> None:
+                # sent before grounding so the UI can alert ~0.3 s after the frame instead of ~1-2 s
+                self.publish({"type": "judge", "stream_id": self.stream_id, "frame_ts": _ts, "prompt": _p,
+                              "score": score, "detected": detected, "latency_ms": round(elapsed_ms)})
+
             try:
-                r = self.client.infer(frames, s.prompt, s.window_sec)
+                r = self.client.infer(frames, s.prompt, s.window_sec, on_judge=on_judge)
             except (httpx.HTTPError, ValueError) as e:
                 self.error = f"inference failed: {e}"
                 log.warning("[%s] %s", self.stream_id, self.error)
@@ -101,6 +109,11 @@ class InferenceWorker:
                 "latency_ms": round(r.latency_ms),
                 "infer_fps": self.infer_fps,
             })
+            if r.detected and self.on_detection:
+                try:
+                    self.on_detection(s.prompt, last_ts, r.score, r.boxes, frames[-1])
+                except Exception:  # never let event storage kill the inference loop
+                    log.exception("[%s] event store failed", self.stream_id)
             wait = s.interval_ms / 1000 - (time.monotonic() - t0)
             if wait > 0:
                 self._stop.wait(wait)

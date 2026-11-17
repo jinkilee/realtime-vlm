@@ -46,7 +46,9 @@ inference:
 
 stream:
   max_streams: 4
-  buffer_fps: 10                    # frames/s kept in the ring buffer (downscaled to preprocess.max_side)
+  buffer_fps: 10                    # frames/s kept in the ring buffer
+  buffer_max_side: 960              # ring buffer frame size (inference resizes to preprocess.max_side;
+                                    # this size is what event snapshots get). ~60 MB/stream at 16:9
   buffer_sec: 4.0                   # ring buffer length; must be >= any stream's window_sec
   # min period between request starts per stream (0 = back-to-back). 4 streams, RTX 4060 + 4B-FP8:
   #   250 ms -> detection (judge+bbox) p90 ~4 s, 500 -> 2.5-4 s, 1000 -> ~1.7 s (GPU saturated in all)
@@ -55,6 +57,11 @@ stream:
   mjpeg_quality: 80
   mjpeg_max_side: 960               # live preview long edge (px)
   reconnect_max_sec: 10             # RTSP reconnect backoff ceiling
+
+events:
+  dir: data/events                  # events.jsonl + <YYYYMMDD>/<id>.jpg snapshots (relative to project root)
+  cooldown_sec: 5.0                 # detections within this gap on the same stream merge into one event
+  max_in_memory: 500
 
 app:
   port: 8000
