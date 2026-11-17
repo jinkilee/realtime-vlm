@@ -1,0 +1,18 @@
+# Ground truth for videos/samples (UR Fall Detection Dataset, RGB crop). Labeled by eye from 0.25 s contact sheets.
+# positive: [start, end] seconds where "a person falling / fallen" applies to the latest frame.
+# ignore:   ambiguous transition intervals, excluded from scoring.
+query: 넘어지는 사람
+person_query: 사람          # used to build pseudo-GT person boxes (single frame grounding)
+videos:
+  - path: videos/samples/urfd-fall-01-rgb.mp4
+    positive: [[3.0, 99]]
+    ignore: [[2.75, 3.0]]
+  - path: videos/samples/urfd-fall-02-rgb.mp4
+    positive: [[2.0, 99]]
+    ignore: [[1.5, 2.0]]
+  - path: videos/samples/urfd-fall-05-rgb.mp4
+    positive: [[3.0, 99]]
+    ignore: [[2.75, 3.0]]
+  - path: videos/samples/urfd-adl-01-rgb.mp4   # walks in, crouches to pick something up — no fall
+    positive: []
+    ignore: []

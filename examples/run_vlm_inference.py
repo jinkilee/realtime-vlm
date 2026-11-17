@@ -65,7 +65,8 @@ def render(frames: list[np.ndarray], res: InferResult, title: str) -> np.ndarray
 def report(tag: str, res: InferResult, show_raw: bool) -> None:
     boxes = [{"label": b.label, "bbox": [round(v, 3) for v in (b.x1, b.y1, b.x2, b.y2)]} for b in res.boxes]
     print(f"{tag:>10} | {res.latency_ms:6.0f} ms | sent {res.image_size[0]}x{res.image_size[1]} "
-          f"| prompt_tok {res.usage.get('prompt_tokens', '?'):>5} | {len(boxes)} box(es) "
+          f"| prompt_tok {res.usage.get('prompt_tokens', '?'):>5} "
+          f"| score {'-' if res.score is None else f'{res.score:.2f}':>4} | {len(boxes)} box(es) "
           f"{json.dumps(boxes, ensure_ascii=False)}")
     if show_raw:
         print("           raw:", res.raw.replace("\n", " "))
@@ -79,6 +80,7 @@ def main() -> int:
     ap.add_argument("--prompt", required=True, help='free-text query, e.g. "넘어지는 사람"')
     ap.add_argument("--at", type=float, help="video: timestamp (s) of the last frame (default: middle)")
     ap.add_argument("--sweep", type=float, help="video: run every N seconds over the whole video")
+    ap.add_argument("--strategy", help="override inference.strategy (multi_image|two_stage|single_frame)")
     ap.add_argument("--num-frames", type=int, help="override inference.num_frames")
     ap.add_argument("--window-sec", type=float, help="override inference.window_sec")
     ap.add_argument("--max-side", type=int,
@@ -89,6 +91,8 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = copy.deepcopy(config.load())
+    if args.strategy:
+        cfg["inference"]["strategy"] = args.strategy
     if args.num_frames:
         cfg["inference"]["num_frames"] = args.num_frames
     if args.window_sec:
@@ -100,7 +104,7 @@ def main() -> int:
     client = VLLMClient(cfg, args.server or config.serving_url(cfg))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"server={client.url} model={client.model} prompt={args.prompt!r} "
+    print(f"server={client.url} model={client.model} strategy={cfg['inference']['strategy']} prompt={args.prompt!r} "
           f"max_side={cfg['preprocess']['max_side']}")
 
     if args.image:
