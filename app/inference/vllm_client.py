@@ -18,6 +18,7 @@ import numpy as np
 from app.inference import parser, preprocess, prompts
 
 STRATEGIES = ("multi_image", "two_stage", "single_frame")
+PRIORITY_GROUND, PRIORITY_JUDGE = 0, 10  # used when serving.scheduling_policy == priority
 
 
 @dataclass
@@ -45,7 +46,8 @@ class VLLMClient:
         self.http = httpx.Client(timeout=cfg["inference"]["timeout_sec"])
 
     # ---- low level --------------------------------------------------------------------
-    def _chat(self, frames_bgr: list[np.ndarray], text: str, max_tokens: int, logprobs: bool = False) -> dict:
+    def _chat(self, frames_bgr: list[np.ndarray], text: str, max_tokens: int, logprobs: bool = False,
+              priority: int = 0) -> dict:
         pp, inf = self.cfg["preprocess"], self.cfg["inference"]
         content = [{"type": "image_url", "image_url": {"url": u}}
                    for u in preprocess.prepare(frames_bgr, pp["max_side"], pp["jpeg_quality"])]
@@ -58,6 +60,8 @@ class VLLMClient:
         }
         if logprobs:
             body.update(logprobs=True, top_logprobs=10)
+        if self.cfg["serving"].get("scheduling_policy") == "priority":
+            body["priority"] = priority  # vLLM extension: lower = served first
         r = self.http.post(self.url, json=body)
         r.raise_for_status()
         return r.json()
@@ -95,7 +99,8 @@ class VLLMClient:
         elif strategy == "multi_image":
             boxes, raw, usage = self._ground(frames_bgr, query, window)
         else:  # two_stage
-            data = self._chat(frames_bgr, prompts.judge(query, len(frames_bgr), window), 1, logprobs=True)
+            data = self._chat(frames_bgr, prompts.judge(query, len(frames_bgr), window), 1, logprobs=True,
+                              priority=PRIORITY_JUDGE)
             score = self._yes_prob(data)
             usage = data.get("usage", {})
             raw = f"judge P(yes)={score:.3f}"

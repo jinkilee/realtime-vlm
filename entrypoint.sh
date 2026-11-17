@@ -27,7 +27,9 @@ log "${SERVING} is ready: model=${MODEL_ID} served-as=${SERVED_MODEL_NAME}"
 
 if [[ -f app/main.py ]]; then
   log "starting app on :${APP_PORT}"
-  python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT}" &
+  RELOAD_ARGS=()
+  [[ "${APP_RELOAD}" == "1" ]] && RELOAD_ARGS=(--reload --reload-dir app --reload-dir configs)
+  python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT}" "${RELOAD_ARGS[@]}" &
   APP_PID=$!
   trap 'kill -TERM ${APP_PID} ${SERVING_PID} 2>/dev/null; wait' INT TERM
   wait -n "${APP_PID}" "${SERVING_PID}"
