@@ -1,0 +1,1 @@
+mkdir -p videos data && docker run --rm -it --name realtime-vlm --gpus all --ipc=host -p 127.0.0.1:8000:8000 -p 127.0.0.1:9000:9000 -v $HOME/.cache/huggingface:/root/.cache/huggingface -v $(pwd)/videos:/videos -v $(pwd)/data:/data -e SERVING=${SERVING:-vllm} -e MODEL_ID=${MODEL_ID:-Qwen/Qwen3-VL-2B-Instruct} realtime-vlm:latest
