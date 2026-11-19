@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from app import config
 from app.inference.preprocess import resize_long_edge
 from app.events.store import EventStore
+from app.profiling import prof
 from app.schemas import StreamCreate, StreamUpdate
 from app.streams.manager import StreamError, StreamManager
 
@@ -26,6 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("app")
 
 CFG = config.load()
+prof.enabled = bool(CFG.get("profiling", {}).get("enabled", False))
 ROOT = config.ROOT
 VIDEO_DIR = ROOT / "videos"
 UPLOAD_DIR = VIDEO_DIR / "uploads"
@@ -72,7 +74,9 @@ def _chown_like_workspace(path: Path) -> None:
 
 async def _status_loop():
     while True:
+        t = time.perf_counter()
         await asyncio.sleep(1.0)
+        prof.add("loop.lag", (time.perf_counter() - t - 1.0) * 1000)  # event loop / GIL stalls (WS, REST)
         if hub.clients:
             hub.publish({"type": "status", "ts": time.time(),
                          "streams": [s.info() for s in manager.streams.values()]})
@@ -158,6 +162,7 @@ def mjpeg(sid: str, overlay: bool = Query(False, description="draw the last boxe
             frame, _ts, seq = stream.source.latest()
             if frame is not None and seq != last_seq:
                 last_seq = seq
+                t_m = time.perf_counter()
                 img = resize_long_edge(frame, stc["mjpeg_max_side"])
                 if overlay:
                     img = img.copy()
@@ -166,6 +171,7 @@ def mjpeg(sid: str, overlay: bool = Query(False, description="draw the last boxe
                         x1, y1, x2, y2 = b.to_pixels(w, h)
                         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, stc["mjpeg_quality"]])
+                prof.add("mjpeg.encode", (time.perf_counter() - t_m) * 1000)  # resize + overlay + JPEG
                 if ok:
                     yield (f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(buf)}\r\n\r\n"
                            .encode() + buf.tobytes() + b"\r\n")
@@ -182,6 +188,21 @@ def snapshot(sid: str):
         raise HTTPException(404, "no frame yet")
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return StreamingResponse(iter([buf.tobytes()]), media_type="image/jpeg")
+
+
+# ---- profiling (see app/profiling.py) ----------------------------------------------------------
+@app.get("/api/profile")
+def get_profile():
+    return prof.summary()
+
+
+@app.post("/api/profile")
+def set_profile(enabled: bool = True, reset: bool = True):
+    """Turn stage timing on/off at runtime; reset=true clears what was collected."""
+    prof.enabled = enabled
+    if reset:
+        prof.reset()
+    return prof.summary()
 
 
 # ---- videos ---------------------------------------------------------------------------------

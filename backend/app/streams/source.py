@@ -21,6 +21,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from app.inference.preprocess import resize_long_edge  # noqa: E402
+from app.profiling import prof  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +121,8 @@ class FrameSource:
                 # fixed slots (not "period since last push") so 30 fps input gives exactly buffer_fps
                 self._next_buffer_t = max(self._next_buffer_t + self.buffer_period, now - self.buffer_period)
                 self._times.append(now)
-                self._frames.append(resize_long_edge(frame, self.max_side))
+                with prof.span("decode.buffer_resize"):  # under the lock: sample() waits for this
+                    self._frames.append(resize_long_edge(frame, self.max_side))
                 while self._times and now - self._times[0] > self.buffer_sec:
                     self._times.popleft()
                     self._frames.popleft()
@@ -147,7 +149,8 @@ class FrameSource:
             fps_t0, fps_n = time.monotonic(), 0
 
             while not self._stop.is_set():
-                ok, frame = cap.read()
+                with prof.span("decode.read"):
+                    ok, frame = cap.read()
                 if not ok:
                     if self.is_file:  # loop the file
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -161,7 +164,8 @@ class FrameSource:
                         self.status.state, self.status.error = "reconnecting", "stream lost"
                         self.status.reconnects += 1
                         break
-                self._push(frame, time.time())
+                with prof.span("decode.push"):
+                    self._push(frame, time.time())
                 self.status.frames_read += 1
                 fps_n += 1
                 now = time.monotonic()
