@@ -23,8 +23,9 @@ realtime-vlm takes up to four RTSP cameras / MP4 videos at once, uses a VLM (Vis
 7. [Development](#development)
 8. [API](#api)
 9. [Performance and limitations](#performance-and-limitations)
-10. [Project layout](#project-layout)
-11. [Sample video sources](#sample-video-sources)
+10. [Profiling](#profiling)
+11. [Project layout](#project-layout)
+12. [Sample video sources](#sample-video-sources)
 
 ---
 
@@ -153,6 +154,7 @@ One file shared by serving and backend. Backend values apply on save; serving va
 | | `gpu_memory_utilization` | `0.85` | for 4B; use 0.78 for 2B |
 | | `max_model_len` | `2048` | for 4B; use 8192 for 2B |
 | | `scheduling_policy` | `priority` | serve box requests before judge requests |
+| | `extra_args` / `extra_env` | `""` / `{}` | extra `vllm serve` flags / environment variables (e.g. profiling, see below) |
 | preprocess | `max_side` | `448` | long edge (px) of frames sent to the server; also used for the server's memory profiling and image size cap |
 | inference | `strategy` | `two_stage` | `two_stage` \| `multi_image` \| `single_frame` |
 | | `judge_threshold` | `0.5` | judge score threshold |
@@ -162,6 +164,7 @@ One file shared by serving and backend. Backend values apply on save; serving va
 | | `buffer_fps` / `buffer_max_side` | `10` / `960` | ring buffer rate / resolution (= snapshot resolution) |
 | events | `cooldown_sec` | `5.0` | re-detections within this gap merge into one event |
 | backend | `reload` | `true` | auto-reload on code changes |
+| profiling | `enabled` | `false` | stage timing for `/api/profile` (also switchable at runtime) |
 
 The env vars `SERVING` and `MODEL_ID` override serving values (e.g. `MODEL_ID=model_files/Qwen3-VL-2B-Instruct sh run_docker.sh`). Adjust the memory settings (`gpu_memory_utilization`, `max_model_len`) in the config to match.
 
@@ -192,6 +195,7 @@ docker exec realtime-vlm-frontend npx tsc --noEmit
 ```
 
 - The stream list lives in memory only. When the backend restarts (including auto-reload on code changes) streams are gone; events stay in `data/events/`.
+- **Auto-reload can hang while a browser keeps an MJPEG preview open** (uvicorn waits for open connections to close: the log stops at `Waiting for connections to close`). Run `docker restart realtime-vlm-backend`.
 - Backend and frontend run as the host user's UID, so files in `data/` and `videos/uploads/` are owned by you.
 
 ## API
@@ -209,6 +213,7 @@ Backend: `http://127.0.0.1:8001` (also reachable through the UI as `http://127.0
 | POST | `/api/upload` | upload a video (multipart `file`) |
 | GET / DELETE | `/api/events` | list events (`?stream_id=&limit=`) / clear all |
 | GET | `/event-files/{YYYYMMDD}/{id}.jpg` | event snapshot |
+| GET / POST | `/api/profile` | stage timing + CPU per thread / `?enabled=true&reset=true` turn on/off, reset (see [Profiling](#profiling)) |
 | WS | `/ws` | `status` (every 1 s), `judge`, `result`, `event`, `error` messages |
 
 ## Performance and limitations
@@ -225,6 +230,268 @@ RTX 4060 8GB + Qwen3-VL-4B-FP8, 4 streams at once (1 RTSP + 3 MP4):
 - **GPU memory is tight.** About 7.2 of 8 GB is used and the KV cache holds ~3,200 tokens. If Windows uses a lot of GPU memory, serving may fail to start.
 - **Live boxes are drawn for the frame that was analyzed**, so on moving targets they trail by about 1 s. Event snapshots are drawn on that same frame, so they are accurate.
 - **Snapshot folder dates use the container's time zone (UTC).** Times in the UI use the browser's time zone.
+
+## Profiling
+
+Three tools, from cheap to expensive:
+
+| Question | Tool |
+|---|---|
+| Is setting A faster than B? What are the latency percentiles at this load? | [`vllm bench serve`](#vllm-benchmark-vllm-bench-serve) (`bench_vllm.sh`): vLLM alone, one command per run |
+| Where does the time of the whole service go (backend, network, vLLM)? | [whole-system profiling](#how-the-whole-system-was-profiled) (`metrics_scenario.sh`) |
+| Why is vLLM slow (GPU timeline, engine loop)? | [inside vLLM](#inside-vllm): py-spy, torch profiler; only when a benchmark looks wrong |
+
+### How the whole system was profiled
+
+The first guess was "the VLM is the slowest part". Instead of assuming it, the whole pipeline
+(decode → ring buffer → sample → preprocess → HTTP → vLLM → publish → WebSocket / MJPEG) was measured in three steps.
+A line profiler (`line_profiler`, `cProfile`) was not used. Its per-line hooks slow the 30 fps decode loops enough to change the result. You also have to decide in advance which functions to decorate, which is the same guess again. `cProfile` only follows the main thread. And neither tool can tell CPU time from *waiting*: an inference thread spends almost all of its time blocked on HTTP.
+
+1. **Stage timing with `perf_counter` (`backend/app/profiling.py`)**: answers where the latency of one inference cycle goes.
+   - `prof.span("stage")` / `prof.add(...)` wrap each stage. Spans are kept per stage, and `GET /api/profile` returns count, rate, mean, p50/p90/p99/max and `busy` (seconds spent in the stage per wall-clock second).
+   - Also recorded:
+     - **frame age**: how old the newest frame is when the cycle starts, when the judge is published and when the result is published.
+     - **asyncio loop lag**.
+     - **CPU per thread**, read from `/proc/self/task/<native_id>/stat` and mapped to Python thread names (`src:*` decode, `infer:*` inference, `MainThread` asyncio). Whatever is left of the process total is native threads (ffmpeg, OpenCV).
+   - Comparing the client-side HTTP time with vLLM's own `e2e` metric gives the network + API server cost.
+   - Off by default (`profiling.enabled`); `POST /api/profile?enabled=true` turns it on and resets it at runtime. When off, each span costs one attribute check.
+2. **Sampling profiler: py-spy**: answers which code spends the CPU, including C code (OpenCV, ffmpeg) and the GIL.
+   - It attaches to the running process with no code change, sees every thread, and adds almost no overhead.
+   - Two recordings run over the same window:
+     - all threads with native frames (`--threads --native`, speedscope format)
+     - only the thread holding the GIL (`--gil`, shows GIL contention)
+   - The container has no `SYS_PTRACE`, so py-spy runs through `docker exec --privileged -u root`. This works without recreating the container, and py-spy is installed on first use.
+   - With uvicorn `--reload`, the app is the reloader's child process (`spawn_main`, parent PID 1), not PID 1.
+3. **Run a reproducible load and collect everything at once (`metrics_scenario.sh` → `profile_report.py`)**.
+   - The script replaces all streams with N sample videos, optionally opens the MJPEG previews like the UI does, and warms up.
+   - Over the same window it collects vLLM `/metrics` (`vllm_metrics.py`, incl. GPU utilization), WebSocket stats (`ws_monitor.py`), `/api/profile` and the two py-spy recordings.
+   - `profile_report.py` merges them into one report:
+     - stage table
+     - per-cycle breakdown
+     - client HTTP vs vLLM engine time
+     - CPU per thread
+     - py-spy hottest frames per thread group
+     - GIL holders
+
+```bash
+# 1. stage timing by hand (streams running)
+curl -X POST 'http://127.0.0.1:8001/api/profile?enabled=true'    # on + reset
+curl -s http://127.0.0.1:8001/api/profile | python3 -m json.tool  # after a while
+
+# 2. py-spy by hand (app = child of the uvicorn reloader)
+docker exec -u root realtime-vlm-backend pip install py-spy
+docker exec --privileged -u root realtime-vlm-backend py-spy dump --pid <app pid>
+docker exec --privileged -u root realtime-vlm-backend py-spy top  --pid <app pid>
+
+# 3. scenario: REMOVES all current streams, adds N sample videos with one prompt, warms up 10 s, collects all of the above
+#   metrics_scenario.sh <label> <n_streams> <prompt> [interval_ms] [sec]
+sh backend/examples/metrics_scenario.sh 4s-judgeonly 4 "불타는 자동차" 1000 60   # nothing matches: judge only
+sh backend/examples/metrics_scenario.sh 4s-person    4 "사람"         1000 60   # always matches: judge + boxes every time
+sh backend/examples/metrics_scenario.sh 4s-fall      4 "넘어지는 사람" 1000 60   # realistic
+MJPEG=1 VIDEO_DIR=videos/samples-1080p PYSPY=0 \
+  sh backend/examples/metrics_scenario.sh p4-1080p 4 "넘어지는 사람" 1000 60      # 1080p + live previews, no py-spy
+#   options: MJPEG=1 pull every stream's preview (like the UI), VIDEO_DIR (default videos/samples),
+#            PYSPY=0 skip py-spy, WARMUP (default 10 s)
+#   → data/metrics/<label>.json (vLLM), .ws.txt, .profile.json, .pyspy.json, .gil.txt
+python3 backend/examples/profile_report.py data/metrics/<label>   # print the combined report again
+
+# vLLM metrics alone (while the UI / streams are running; Ctrl+C reports early)
+python3 backend/examples/vllm_metrics.py --sec 60 --label my-test --out data/metrics/my-test.json --buckets
+```
+
+The sample videos are 320x240. They are smaller than `preprocess.max_side` (448), so they are sent as-is with fewer image tokens than a real camera. To load the system like 1080p cameras, make upscaled copies (aspect ratio is stretched to 16:9; fine for load tests):
+
+```bash
+mkdir -p videos/samples-1080p
+for v in urfd-fall-01-rgb urfd-fall-02-rgb urfd-fall-05-rgb urfd-adl-01-rgb; do
+  docker exec realtime-vlm-backend ffmpeg -v error -y -i /workspace/videos/samples/$v.mp4 \
+    -vf scale=1920:1080:flags=lanczos,setsar=1 -c:v libx264 -preset veryfast -b:v 6M -an /workspace/videos/samples-1080p/$v.mp4
+done
+```
+
+Main stages in `/api/profile` (ms):
+
+| Stage | What it measures |
+|---|---|
+| `decode.read` / `decode.push` / `decode.buffer_resize` | `cap.read()` (ffmpeg decode) / storing the frame / resize to 960 for the ring buffer (under the lock) |
+| `worker.sample` | picking N frames from the ring buffer |
+| `infer.{judge,ground}.prep` | resize to 448 + JPEG + base64 of all frames of the request |
+| `infer.{judge,ground}.encode` / `.http` / `.decode` | JSON encode / HTTP round trip (network + vLLM) / JSON decode; `.req_kb` = request size in KB |
+| `worker.infer.1call` / `.2call` | whole `infer()` without / with grounding |
+| `worker.publish`, `worker.event_store` | WebSocket hand-off, event + snapshot write |
+| `worker.cycle` / `worker.idle` | one cycle without the interval wait / the wait |
+| `age.sampled` / `age.judge` / `age.result` | age of the newest frame at cycle start / judge published / result published |
+| `mjpeg.encode` | preview resize + JPEG per frame sent |
+| `loop.lag` | asyncio event loop delay (stalls of REST / WS) |
+
+Notes:
+- **Run-to-run variation of the vLLM numbers is about ±10%** (same 1080p setup: e2e 862 / 954 / 993 ms). Repeat a run before trusting a difference.
+- **py-spy `--native` stops the process ~50 times a second** to unwind C stacks. That roughly doubles the stage times of C-heavy code (e.g. `decode.read` 1.4 → 2.7 ms, `mjpeg.encode` 1.5 → 3.0 ms). Use `PYSPY=0` runs for stage times and py-spy runs for *where* CPU goes.
+- py-spy `--native` reports threads blocked in a lock or syscall as active. The report puts those samples in a separate "blocked" count.
+- Spans that started before a reset are dropped, so a window never mixes a whole cycle with only part of its sub-stages. Cycles still running at the end of the window can still make the per-cycle sum off by about 1%.
+- Client HTTP vs vLLM `e2e` can only be compared to within tens of ms with 4 streams: the two tools' windows differ by 1–2 s, and a few 5–10 s requests move the means. With 1 stream the difference was 2.6 ms.
+
+#### vLLM metrics
+
+vLLM exposes Prometheus metrics at `http://127.0.0.1:9000/metrics`. `backend/examples/vllm_metrics.py` takes a snapshot before and after a time window, so the numbers cover only requests that finished inside that window. It also samples running/waiting requests, KV cache usage and GPU utilization (`nvidia-smi`) during the window. It uses only the Python standard library and runs on the host or in the backend container (`--url http://serving:9000`).
+
+What the output means:
+
+| Line | Meaning |
+|---|---|
+| end-to-end | server-side time of one request = queue + prefill + decode |
+| queue | waiting for the scheduler (0 = never queued) |
+| prefill | from scheduling to the first token: vision encoder + prompt processing (judge: 4 images ~410 tokens, boxes: 1 image ~200 tokens) |
+| decode | generating the output tokens (judge: 1 token, boxes: ~44 tokens) |
+| inter-token latency | time per decode step; grows when another stream's prefill shares the step |
+| tokens / engine step | how many tokens the GPU processed per step (batch size) |
+| multimodal cache hit | images whose processing was reused (consecutive requests share frames) |
+| client side (ws.txt) | latency seen by the backend, incl. preprocessing and HTTP; `det p90` = judge + boxes |
+
+Notes:
+- **Judge and box requests are mixed in the same histograms.** Use scenarios (nothing matches / always matches) to separate them, and compare the client-side numbers.
+- **The mean is exact; percentiles are only upper bounds (`p90<=`)** because vLLM's buckets are coarse (queue / prefill / decode: 0.3, 0.5, 0.8, 1.0, 1.5 s...).
+- Counters reset when serving restarts; a restart inside the window gives wrong numbers.
+
+### Results
+
+#### Whole system (2026-11-20, 4B-FP8, 4 streams, `넘어지는 사람`, interval 1000 ms, 4 MJPEG viewers)
+
+| Input | prompt tokens / req | vLLM e2e | prefill | decode | latency p90 | detection p90 (judge + boxes) | GPU | backend CPU |
+|---|---|---|---|---|---|---|---|---|
+| 320x240 samples | 354 | 500 ms | 205 ms | 240 ms | 0.4–1.9 s | 1.9–2.0 s | 95% | 0.26 cores |
+| 1080p (3 runs) | 465–469 | 862–993 ms | 348–434 ms | 337–407 ms | 0.7–5.9 s | 5.4–6.5 s | 98–99% | 1.4 cores |
+| 1080p, interval 0 | 494 | 1,132 ms | 416 ms | 586 ms | 0.7–9.1 s | 8.8–9.5 s | 100% | 1.6 cores |
+
+Where one inference cycle goes (1080p, no py-spy, mean of 155 cycles = 1,131 ms):
+
+| Part | Mean | Share |
+|---|---|---|
+| sample frames from the ring buffer | 0.0 ms | 0% |
+| preprocess (resize + JPEG + base64) | 5.6 ms | 0.5% |
+| JSON encode / decode, publish, event store | 0.6 ms | 0.1% |
+| **vLLM HTTP round trips (judge + boxes)** | **1,140 ms** | **~99%** |
+
+- **The VLM is the bottleneck (measured, not assumed).**
+  - The backend's own work is ~6 ms per cycle.
+  - Network + vLLM API server costs less than the measurement can resolve (2.6 ms with 1 stream).
+  - The GPU is 98–99% busy.
+- **The backend is not under load.**
+  - It uses 1.4 of 16 cores, and 1.06 of those are ffmpeg decoding 4 × 1080p × 30 fps (~0.3 core per stream).
+  - The GIL is held only ~6% of the time, and the event loop lag is under 1 ms at p99.
+  - CPU matters only for scaling to more streams, not for latency.
+- **The 320x240 sample videos give optimistic numbers.** They are not upscaled to 448, so each request has ~25% fewer prompt tokens. vLLM time roughly doubles with 1080p input (500 → 860–990 ms), and detection p90 grows from ~2 s to ~6 s.
+- **1080p showed a long tail that 320x240 didn't.**
+  - Judge HTTP: p50 350 ms but p99 3.8 s. vLLM prefill p99 fell in the ≤5 s bucket.
+  - There was no queueing and no preemption.
+  - It disappeared after restarting serving (judge p99 0.59 s). See [inside vLLM](#inside-vllm).
+- **`interval_ms: 0` does not help.** Throughput rises only ~12%. The stream with no detections (judge only) gets 1.9 req/s while the detecting streams drop to 0.3–0.5 req/s with detection p90 ~9 s.
+- Frames are ~50 ms old when a cycle starts (ring buffer at 10 fps), which is negligible.
+
+#### vLLM only
+
+First vLLM-only results (2026-11-19, 4B-FP8, interval 1000 ms, sample videos 320x240, no preview viewers):
+
+| Scenario | req/s (server) | prefill mean | decode mean | inter-token mean | client latency | GPU util |
+|---|---|---|---|---|---|---|
+| 1 stream, always matches | 1.95 | 92 ms | 372 ms | 19 ms | 960 ms (judge+boxes) | 90% |
+| 4 streams, judge only | 4.00 | 346 ms | 0 | – | 172 / 340 / 538 / 566 ms by stream | 61% |
+| 4 streams, always matches | 5.07 | 161 ms | 564 ms | 29 ms (p99 ≤150 ms) | ~1.55 s, only 0.65 of 1 req/s per stream | 100% |
+| 4 streams, falls (realistic) | 4.28 | 192 ms | 258 ms | 29 ms | no detection ~330 ms, detection p90 ~1.8 s | 97% |
+
+- **Box decoding dominates detection latency.** ~44 tokens × 18 ms (alone) – 29 ms (4 streams) = 0.8–1.3 s of the ~1.7 s. 18 ms/token for one sequence is close to the time to read the weights once from GPU memory (memory-bandwidth bound), so the lever is fewer output tokens, not faster kernels.
+- **Judges of the 4 streams are processed one after another** (~170 ms each), because all streams fire at the same moment. Their latency stacks up to 566 ms even though the GPU is only ~60% busy.
+- ~170 ms of prefill for ~410 tokens looked more than plain compute would suggest. The torch profiler answered this: it is plain compute (see [inside vLLM](#inside-vllm)).
+
+### Inside vLLM
+
+Done the same way as the backend: first py-spy without a restart, then the GPU timeline.
+
+1. **py-spy on the API server (PID 1) and the EngineCore process** (`--idle`, so waiting is included), under the 4 × 1080p load.
+   - Run it with `docker exec --privileged realtime-vlm-serving py-spy record --pid <pid> --threads --idle`.
+   - The samples are in time order, so long runs of the same stack show where the engine loop stalls.
+2. **torch profiler (GPU timeline)**. It needs a serving restart with these settings:
+
+   ```yaml
+   serving:
+     extra_args: "--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/tmp/vllm_prof --profiler-config.torch_profiler_with_stack=false"
+   ```
+
+   - Then `curl -X POST http://127.0.0.1:9000/start_profile`, wait a few seconds, and `curl -X POST .../stop_profile`.
+   - Copy the result with `docker cp realtime-vlm-serving:/tmp/vllm_prof .`. `rank0.*.pt.trace.json.gz` opens in Perfetto; `rank0.profiler_out.txt` is a CUDA time table per kernel.
+   - Starting and stopping the profiler stalls the engine for seconds, so leave those requests out of latency numbers.
+   - `--enable-logging-iteration-details` adds one log line per engine step (prefill / decode requests, tokens, encoder inputs). It shows what each step contained. With async scheduling the logged time is not GPU time.
+3. **A/B by restarting serving with one setting changed** (`extra_env` for environment variables).
+
+Findings (2026-11-20, 4 × 1080p, interval 1000 ms):
+
+| Step (torch profiler, 6 s) | GPU time per step |
+|---|---|
+| decode only (1–3 sequences) | ~15 ms |
+| + 1 judge prefill (4 images, 536 tokens) | ~195 ms |
+| + 2 judge prefills (1,072 tokens) | ~378 ms |
+| + 1 box prefill (1 image, 146 tokens; the image is reused from the judge's encoder output) | ~50 ms |
+
+- **The GPU is 98% busy and the kernels are efficient.**
+  - The longest GPU idle gap in 6 s was 6 ms.
+  - The FP8 GEMMs (Marlin) take 43% of GPU time. A judge prefill computes ~3.9 TFLOP in ~112 ms (~35 TFLOPS), close to what an RTX 4060 can do in bf16. The prefill is compute-bound; it is not a slow kernel.
+  - The vision encoder (bf16, no CUDA graph) takes ~14%.
+- **The vLLM API server is idle 98% of the time.** Image decoding and the HF processor cost almost nothing, because consecutive requests share frames and hit the processor cache.
+- **The engine loop "stalls" are the CPU waiting for a busy GPU.**
+  - py-spy showed single calls blocking for 0.4–1.3 s (`Event.synchronize`, a triton kernel launch, the image tensor copy to the GPU).
+  - The GPU timeline shows no gap at the same time, so the GPU was working.
+- **Pinned memory has no measurable effect.**
+  - Under WSL, vLLM turns pinned memory off. Image tensors are then copied from pageable memory, and the engine thread blocks until earlier GPU work is done (9% of its time).
+  - `VLLM_WSL2_ENABLE_PIN_MEMORY=1` removes that wait, but latency changes by only −5% (e2e 639 → 608 ms), within the run-to-run variation, and it uses 107 MiB more VRAM. Left off.
+- **The 1080p long tail went away after a serving restart.** Same load: e2e 862–993 → 639 ms, judge p99 3.8 → 0.59 s, box p99 6.3 → 2.5 s. Serving had been up ~2 hours before. Whether it degrades with uptime is not confirmed yet; it needs a long run that samples latency over time.
+
+### vLLM benchmark (`vllm bench serve`)
+
+To compare settings, benchmark vLLM alone with vLLM's own benchmark tool, with no backend and no video streams.
+
+- `backend/examples/bench_vllm.sh` sends this service's two request shapes at the same time as Poisson traffic (`--dataset-name random-mm`):
+  - judge: 4 images 448x252 + ~88 text tokens → 1 token
+  - ground (boxes): 1 image 448x252 + ~34 text tokens → 44 tokens
+- It prints TTFT / e2e percentiles per request type. It saves the full `vllm bench` result and a histogram JSON per type:
+  - e2e and TTFT, each with n / mean / p50 / p90 / p99 / max
+  - fixed bins (`lo`, `hi`, `count`)
+  - the raw samples in ms
+- `backend/examples/plot_latency_hist.py` draws the histograms of several runs as one SVG (standard library only).
+- The images are random noise, so vLLM's multimodal caches never hit. That makes the numbers slightly worse than in the real service, which reuses frames.
+
+```bash
+# stop the UI streams first (they would add load)
+#   bench_vllm.sh <label> [judge_rps] [ground_rps] [sec]
+sh backend/examples/bench_vllm.sh 1s 1.0 0.3 60    # ~ 1 stream, interval 1000 ms, falls (~30% detections)
+sh backend/examples/bench_vllm.sh 4s 3.2 0.6 60    # ~ 4 streams
+#   → data/metrics/bench/<label>.{judge,ground}.json, <label>.{judge,ground}.hist.json, console summary
+python3 backend/examples/plot_latency_hist.py "1s:1 stream" "4s:4 streams"                 # e2e
+python3 backend/examples/plot_latency_hist.py "1s:1 stream" "4s:4 streams" --metric ttft   # time to first token
+#   → data/metrics/bench/latency_hist_1s_4s_{e2e,ttft}.svg
+```
+
+Results (2026-11-20, 4B-FP8, 60 s each):
+
+![End-to-end latency histogram, 1 vs 4 streams](images/latency_hist_e2e.svg)
+
+![Time to first token histogram, 1 vs 4 streams](images/latency_hist_ttft.svg)
+
+| Load | Request | n | e2e p50 | e2e p90 | e2e p99 | TTFT p50 | TTFT p99 | time per output token |
+|---|---|---|---|---|---|---|---|---|
+| 1 stream (judge 1.0/s + boxes 0.3/s) | judge | 60 | 251 ms | 512 ms | 870 ms | 251 ms | 870 ms | – |
+| | ground | 18 | 1.1 s | 1.3 s | 1.4 s | 106 ms | 434 ms | 23 ms |
+| 4 streams (judge 3.2/s + boxes 0.6/s) | judge | 192 | 502 ms | 1.1 s | 1.5 s | 502 ms | 1.5 s | – |
+| | ground | 36 | 2.4 s | 4.3 s | 5.7 s | 387 ms | 1.3 s | 52 ms |
+
+- **Box requests are where 4 streams hurt.**
+  - Alone, a box request takes ~1.1 s. With 4 streams it takes 2.4 s at p50 and 5.7 s at p99, and the distribution spreads from 1.5 to 6.3 s.
+  - TTFT stays ≤1.3 s. Most of the extra time comes while the 44 tokens are generated: the time per token grows from 23 to 52 ms. Other streams' judge prefills (~195 ms each) run in the same engine steps as the box decode, so each decode step can wait for a whole prefill.
+- **Judge latency doubles** (p50 251 → 502 ms), because 3.2 judges/s × ~195 ms keeps the GPU busy ~60% of the time with judges alone.
+- With 1 stream there are only 18 box requests in 60 s, so their p99 is rough.
+- Next steps to compare with this script:
+  - smaller prefill chunks (`--max-num-batched-tokens`), so decode steps wait less
+  - fewer box output tokens
+  - `scheduling_policy` fcfs vs priority
 
 ## Project layout
 
@@ -247,13 +514,15 @@ realtime-vlm/
 │   │   ├── config.py, schemas.py
 │   │   ├── inference/           # preprocess, prompts, parser, vllm_client (strategies)
 │   │   ├── streams/             # source (RTSP/MP4, ring buffer), worker (inference loop), manager
-│   │   └── events/store.py      # events, snapshots, jsonl
-│   └── examples/                # run_vlm_inference, eval_strategies, ws_monitor
+│   │   ├── events/store.py      # events, snapshots, jsonl
+│   │   └── profiling.py         # stage timing + CPU per thread (/api/profile)
+│   └── examples/                # run_vlm_inference, eval_strategies, ws_monitor, vllm_metrics,
+│                                # metrics_scenario.sh, profile_report, bench_vllm.sh, plot_latency_hist
 ├── frontend/
 │   ├── Dockerfile, package.json, vite.config.ts
 │   └── src/                     # App, useLive (WS), components/ (AddStreamForm, StreamTile, EventPanel)
 ├── tools/rtsp_sim.sh            # test RTSP camera
-├── images/                      # README images
+├── images/                      # README images (UI screenshot, latency histograms)
 ├── model_files/                 # models (not in git)
 ├── videos/                      # input videos, uploads/ (not in git)
 └── data/                        # events/, inference/ (not in git)

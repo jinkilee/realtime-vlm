@@ -44,6 +44,8 @@ def main() -> None:
         "HF_HUB_OFFLINE": "1" if s.get("offline") else "0",
         "VLLM_EXTRA_ARGS": s.get("extra_args") or "",
     }
+    # extra environment for the server process (e.g. VLLM_WSL2_ENABLE_PIN_MEMORY)
+    env.update({str(k): v for k, v in (s.get("extra_env") or {}).items()})
     print("\n".join(f"export {k}={shlex.quote(str(v))}" for k, v in env.items()))
 
 

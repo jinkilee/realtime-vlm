@@ -8,6 +8,7 @@ Strategies (config: inference.strategy):
 """
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ import httpx
 import numpy as np
 
 from app.inference import parser, preprocess, prompts
+from app.profiling import prof
 
 STRATEGIES = ("multi_image", "two_stage", "single_frame")
 PRIORITY_GROUND, PRIORITY_JUDGE = 0, 10  # used when serving.scheduling_policy == priority
@@ -48,10 +50,12 @@ class VLLMClient:
 
     # ---- low level --------------------------------------------------------------------
     def _chat(self, frames_bgr: list[np.ndarray], text: str, max_tokens: int, logprobs: bool = False,
-              priority: int = 0) -> dict:
+              priority: int = 0, stage: str = "ground") -> dict:
+        """stage: profiling label (judge | ground) -> infer.<stage>.{prep,encode,http,decode}"""
         pp, inf = self.cfg["preprocess"], self.cfg["inference"]
-        content = [{"type": "image_url", "image_url": {"url": u}}
-                   for u in preprocess.prepare(frames_bgr, pp["max_side"], pp["jpeg_quality"])]
+        with prof.span(f"infer.{stage}.prep"):  # resize + JPEG + base64, all frames
+            urls = preprocess.prepare(frames_bgr, pp["max_side"], pp["jpeg_quality"])
+        content = [{"type": "image_url", "image_url": {"url": u}} for u in urls]
         content.append({"type": "text", "text": text})
         body = {
             "model": self.model,
@@ -63,9 +67,14 @@ class VLLMClient:
             body.update(logprobs=True, top_logprobs=10)
         if self.cfg["serving"].get("scheduling_policy") == "priority":
             body["priority"] = priority  # vLLM extension: lower = served first
-        r = self.http.post(self.url, json=body)
-        r.raise_for_status()
-        return r.json()
+        with prof.span(f"infer.{stage}.encode"):
+            payload = json.dumps(body).encode()
+        prof.add(f"infer.{stage}.req_kb", len(payload) / 1024)  # not a time: request size (KB)
+        with prof.span(f"infer.{stage}.http"):  # network + vLLM queue/prefill/decode
+            r = self.http.post(self.url, content=payload, headers={"content-type": "application/json"})
+            r.raise_for_status()
+        with prof.span(f"infer.{stage}.decode"):
+            return r.json()
 
     @staticmethod
     def _yes_prob(data: dict) -> float:
@@ -80,7 +89,8 @@ class VLLMClient:
         return p_yes / (p_yes + p_no) if p_yes + p_no > 0 else 0.0
 
     def _ground(self, frames: list[np.ndarray], query: str, window: float) -> tuple[list, str, dict]:
-        data = self._chat(frames, prompts.ground(query, len(frames), window), self.cfg["inference"]["max_tokens"])
+        data = self._chat(frames, prompts.ground(query, len(frames), window), self.cfg["inference"]["max_tokens"],
+                          stage="ground")
         text = data["choices"][0]["message"]["content"] or ""
         return parser.parse(text), text, data.get("usage", {})
 
@@ -104,7 +114,7 @@ class VLLMClient:
             boxes, raw, usage = self._ground(frames_bgr, query, window)
         else:  # two_stage
             data = self._chat(frames_bgr, prompts.judge(query, len(frames_bgr), window), 1, logprobs=True,
-                              priority=PRIORITY_JUDGE)
+                              priority=PRIORITY_JUDGE, stage="judge")
             score = self._yes_prob(data)
             usage = data.get("usage", {})
             raw = f"judge P(yes)={score:.3f}"

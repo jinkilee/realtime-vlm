@@ -21,6 +21,7 @@ serving:
   # (1 token, prefill-heavy); otherwise 4 streams of judges starve grounding (p90 4-5 s -> see P2 notes)
   scheduling_policy: priority       # fcfs | priority
   extra_args: ""                    # appended to `vllm serve` as-is
+  extra_env: {}                     # extra environment variables for `vllm serve` (e.g. {VLLM_WSL2_ENABLE_PIN_MEMORY: "1"})
 
 preprocess:
   # Long edge (px) each frame is resized to before being sent to the server.
@@ -67,3 +68,8 @@ events:
 backend:
   port: 8000                        # inside the compose network (published as 127.0.0.1:8001)
   reload: true                      # uvicorn --reload on backend/app or configs/ changes (dev; source is mounted)
+
+profiling:
+  # Stage timing (decode / sample / preprocess / HTTP / publish / MJPEG), GET /api/profile.
+  # Can also be toggled at runtime: POST /api/profile?enabled=true (resets the counters).
+  enabled: false

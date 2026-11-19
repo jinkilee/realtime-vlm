@@ -13,6 +13,7 @@ import httpx
 
 from app.inference.parser import Box
 from app.inference.vllm_client import VLLMClient
+from app.profiling import prof
 from app.streams.source import FrameSource
 
 log = logging.getLogger(__name__)
@@ -73,7 +74,9 @@ class InferenceWorker:
         while not self._stop.is_set():
             s = self.settings  # replaced atomically by PATCH
             t0 = time.monotonic()
-            sampled = self.source.sample(s.num_frames, s.window_sec)
+            t0_perf = time.perf_counter()
+            with prof.span("worker.sample"):
+                sampled = self.source.sample(s.num_frames, s.window_sec)
             if sampled is None or sampled[1][-1] == last_ts:
                 self._stop.wait(0.05)
                 continue
@@ -82,9 +85,12 @@ class InferenceWorker:
             self.cfg["inference"]["judge_threshold"] = s.judge_threshold
             def on_judge(score: float, detected: bool, elapsed_ms: float, _ts=last_ts, _p=s.prompt) -> None:
                 # sent before grounding so the UI can alert ~0.3 s after the frame instead of ~1-2 s
+                prof.add("age.judge", (time.time() - _ts) * 1000, start=t0_perf)  # newest frame captured -> judge published
                 self.publish({"type": "judge", "stream_id": self.stream_id, "frame_ts": _ts, "prompt": _p,
                               "score": score, "detected": detected, "latency_ms": round(elapsed_ms)})
 
+            prof.add("age.sampled", (time.time() - last_ts) * 1000)  # newest frame age when the cycle starts
+            t_inf = time.perf_counter()
             try:
                 r = self.client.infer(frames, s.prompt, s.window_sec, on_judge=on_judge)
             except (httpx.HTTPError, ValueError) as e:
@@ -93,10 +99,13 @@ class InferenceWorker:
                 self.publish({"type": "error", "stream_id": self.stream_id, "error": self.error})
                 self._stop.wait(1.0)
                 continue
+            prof.add("worker.infer" + (".2call" if r.calls == 2 else ".1call"), (time.perf_counter() - t_inf) * 1000,
+                     start=t0_perf)
             self.error = ""
             self.infer_count += 1
             self._done.append(time.time())
             self.last = LastResult(last_ts, r.boxes, r.score, r.detected, r.latency_ms)
+            t_pub = time.perf_counter()
             self.publish({
                 "type": "result",
                 "stream_id": self.stream_id,
@@ -109,11 +118,16 @@ class InferenceWorker:
                 "latency_ms": round(r.latency_ms),
                 "infer_fps": self.infer_fps,
             })
+            prof.add("worker.publish", (time.perf_counter() - t_pub) * 1000, start=t0_perf)
+            prof.add("age.result", (time.time() - last_ts) * 1000, start=t0_perf)  # newest frame captured -> result published
             if r.detected and self.on_detection:
                 try:
-                    self.on_detection(s.prompt, last_ts, r.score, r.boxes, frames[-1])
+                    with prof.span("worker.event_store"):
+                        self.on_detection(s.prompt, last_ts, r.score, r.boxes, frames[-1])
                 except Exception:  # never let event storage kill the inference loop
                     log.exception("[%s] event store failed", self.stream_id)
             wait = s.interval_ms / 1000 - (time.monotonic() - t0)
+            prof.add("worker.cycle", (time.monotonic() - t0) * 1000, start=t0_perf)  # work only, no interval wait
+            prof.add("worker.idle", max(wait, 0) * 1000, start=t0_perf)
             if wait > 0:
                 self._stop.wait(wait)
