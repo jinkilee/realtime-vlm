@@ -154,7 +154,7 @@ One file shared by serving and backend. Backend values apply on save; serving va
 | | `gpu_memory_utilization` | `0.85` | for 4B; use 0.78 for 2B |
 | | `max_model_len` | `2048` | for 4B; use 8192 for 2B |
 | | `scheduling_policy` | `priority` | serve box requests before judge requests |
-| | `extra_args` / `extra_env` | `""` / `{}` | extra `vllm serve` flags / environment variables (e.g. profiling, see below) |
+| | `extra_args` / `extra_env` | `"--linear-backend triton"` / `{}` | extra `vllm serve` flags / environment variables. The default selects real FP8 W8A8 GEMMs ([FP8 W8A8](#fp8-w8a8---linear-backend-triton)); profiling flags go here too (see below) |
 | preprocess | `max_side` | `448` | long edge (px) of frames sent to the server; also used for the server's memory profiling and image size cap |
 | inference | `strategy` | `two_stage` | `two_stage` \| `multi_image` \| `single_frame` |
 | | `judge_threshold` | `0.5` | judge score threshold |
@@ -226,8 +226,10 @@ RTX 4060 8GB + Qwen3-VL-4B-FP8, 4 streams at once (1 RTSP + 3 MP4):
 | 500 ms | ~300 ms | 2.5–4 s |
 | **1000 ms (default)** | 200–300 ms | **~1.7 s** |
 
-- **Generating the boxes (~44 tokens) is the bottleneck.** Each decode step is batched with other streams' judge requests. With a single stream it takes ~1 s.
-- **GPU memory is tight.** About 7.2 of 8 GB is used and the KV cache holds ~3,200 tokens. If Windows uses a lot of GPU memory, serving may fail to start.
+This table was measured on 2026-11-18 with the Marlin W8A16 kernel. Since the [FP8 W8A8](#fp8-w8a8---linear-backend-triton) switch (2026-11-23), `vllm bench serve` at the 4-stream load shows judge p50 0.8–1.0 s → ~0.3 s and box p50 ~3.4 → ~2.0 s (p99 ~7.8 → 3.5–4.3 s), with the same accuracy.
+
+- **Generating the boxes (~44 tokens) is the bottleneck.** Each decode step is batched with other streams' judge requests. With a single stream it takes ~1 s. FP8 W8A8 made the judge prefills shorter, so decode steps wait less, but the decode itself (memory-bound, ~24 ms per token) did not get faster.
+- **GPU memory is tight.** About 7.2 of 8 GB is used and the KV cache holds ~3,900 tokens (~3,300 before FP8 W8A8). If Windows uses a lot of GPU memory, serving may fail to start.
 - **Live boxes are drawn for the frame that was analyzed**, so on moving targets they trail by about 1 s. Event snapshots are drawn on that same frame, so they are accurate.
 - **Snapshot folder dates use the container's time zone (UTC).** Times in the UI use the browser's time zone.
 
@@ -414,7 +416,7 @@ Done the same way as the backend: first py-spy without a restart, then the GPU t
 
    ```yaml
    serving:
-     extra_args: "--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/tmp/vllm_prof --profiler-config.torch_profiler_with_stack=false"
+     extra_args: "--linear-backend triton --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/tmp/vllm_prof --profiler-config.torch_profiler_with_stack=false"
    ```
 
    - Then `curl -X POST http://127.0.0.1:9000/start_profile`, wait a few seconds, and `curl -X POST .../stop_profile`.
@@ -434,7 +436,7 @@ Findings (2026-11-20, 4 × 1080p, interval 1000 ms):
 
 - **The GPU is 98% busy and the kernels are efficient.**
   - The longest GPU idle gap in 6 s was 6 ms.
-  - The FP8 GEMMs (Marlin) take 43% of GPU time. A judge prefill computes ~3.9 TFLOP in ~112 ms (~35 TFLOPS), close to what an RTX 4060 can do in bf16. The prefill is compute-bound; it is not a slow kernel.
+  - The FP8 GEMMs (Marlin, before the [FP8 W8A8](#fp8-w8a8---linear-backend-triton) switch) take 43% of GPU time. A judge prefill computes ~3.9 TFLOP in ~112 ms (~35 TFLOPS), close to what an RTX 4060 can do in bf16. The prefill is compute-bound; it is not a slow kernel.
   - The vision encoder (bf16, no CUDA graph) takes ~14%.
 - **The vLLM API server is idle 98% of the time.** Image decoding and the HF processor cost almost nothing, because consecutive requests share frames and hit the processor cache.
 - **The engine loop "stalls" are the CPU waiting for a busy GPU.**
@@ -493,6 +495,34 @@ Results (2026-11-20, 4B-FP8, 60 s each):
   - fewer box output tokens
   - `scheduling_policy` fcfs vs priority
 
+### FP8 W8A8 (`--linear-backend triton`)
+
+The model is `Qwen3-VL-4B-Instruct-FP8` (LLM weights FP8 e4m3, 128x128 blocks; vision encoder and `lm_head` bf16). The RTX 4060 (Ada, sm_89) has FP8 tensor cores, but vLLM v0.33 still picked `MarlinFP8ScaledMMLinearKernel` and logged "Your GPU does not have native support for FP8 computation". That kernel is weight-only FP8 (W8A16): it unpacks the weights and multiplies in bf16.
+- For block FP8 on CUDA, vLLM tries the kernels in this order: FlashInfer/DeepGEMM, CUTLASS block (sm_90+ only), B12x, **Marlin**, Triton. On sm_89, Marlin comes before Triton, so Marlin wins.
+- `serving.extra_args: "--linear-backend triton"` selects `TritonFp8BlockScaledMMKernel` instead: activations are quantized to FP8 per token group and the GEMM runs on the FP8 tensor cores (W8A8). The model files stay the same.
+- INT8 W8A8 would run at about the same tensor-core rate on Ada, and it needs a different checkpoint or our own calibration. FP8 W8A8 gives the same gain with the current model.
+
+Results (2026-11-23, `vllm bench serve` via `bench_vllm.sh`, 60 s each; both configurations measured the same day on a freshly restarted serving; 4-stream load run twice):
+
+![End-to-end latency histogram, 4 streams, Marlin W8A16 vs Triton FP8 W8A8](images/latency_hist_fp8_e2e.svg)
+
+![Time to first token histogram, 4 streams, Marlin W8A16 vs Triton FP8 W8A8](images/latency_hist_fp8_ttft.svg)
+
+| Load | Request | Marlin W8A16 (before) p50 / p90 / p99 | Triton FP8 W8A8 (after) p50 / p90 / p99 | time per output token |
+|---|---|---|---|---|
+| 1 stream | judge e2e | 249 / 516 / 894 ms | **198 / 497 / 691 ms** | – |
+| | ground e2e | 1124 / 1357 / 1728 ms | 1153 / 1289 / 1503 ms | 23.6 → 24.2 ms |
+| 4 streams, run 1 | judge e2e | 1014 / 2793 / 3301 ms | **290 / 840 / 2062 ms** | – |
+| | ground e2e | 3379 / 5599 / 7908 ms | **1931 / 3417 / 4274 ms** | 60.9 → 41.8 ms |
+| 4 streams, run 2 | judge e2e | 804 / 1511 / 2133 ms | **309 / 929 / 1316 ms** | – |
+| | ground e2e | 3407 / 5560 / 7778 ms | **1987 / 2995 / 3549 ms** | 64.5 → 42.1 ms |
+
+- **Prefill gets faster, so the 4-stream load stops piling up.** A judge alone is ~20% faster (p50 249 → 198 ms). With 4 streams the judge p50 drops about 3x (0.8–1.0 s → ~0.3 s), and box requests about 1.7x (p50 ~3.4 → ~2.0 s, p99 ~7.8 → 3.5–4.3 s), because the judge prefills they share engine steps with are shorter.
+- **Decode alone does not change** (23.6 → 24.2 ms per token with 1 stream). Decode is limited by memory bandwidth, and the weights were already 8-bit, so the same bytes are read.
+- **More KV cache**: 3,280 → 3,872 tokens (weights 5.85 → 5.79 GiB; the rest of the difference was not investigated).
+- **Accuracy is unchanged** (`eval_strategies.py --strategies two_stage`, 4 UR Fall videos): precision 1.00, recall 0.85, F1 0.92, FP 0, FN 4 as before; IoU 0.98 (was 0.99). Judge scores move by 0.009 on average; the largest negative score is 0.048 (was 0.037), still far below the 0.5 threshold.
+- The 4-stream Marlin baseline here is worse than the 2026-11-20 run above (judge p50 0.8–1.0 s vs 502 ms). At this load the GPU is close to saturation, so runs vary a lot; compare runs from the same day only.
+
 ## Project layout
 
 ```
@@ -501,6 +531,7 @@ realtime-vlm/
 ├── docker-compose.yml
 ├── build_docker.sh              # docker compose build
 ├── run_docker.sh                # docker compose up -d
+├── serving.conf                 # supervisord program for the old single-container setup (entrypoint.sh); not used by docker compose
 ├── configs/config.yaml          # all settings
 ├── serving/
 │   ├── Dockerfile               # based on vllm/vllm-openai
@@ -545,4 +576,6 @@ realtime-vlm/
 - [x] P4 web UI
 - [x] split into containers (serving / backend / frontend)
 - [ ] P5 stabilization and tuning: fewer box output tokens, 4-stream load test
+  - [x] profiling (whole system, vLLM internals, `vllm bench serve`)
+  - [x] FP8 W8A8 GEMMs (`--linear-backend triton`): 4-stream judge ~3x, box ~1.7x faster, same accuracy
 - [ ] P6 Triton serving comparison

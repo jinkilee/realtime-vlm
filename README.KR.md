@@ -153,7 +153,7 @@ serving과 backend가 함께 쓰는 설정 파일입니다. backend 쪽 값은 �
 | | `gpu_memory_utilization` | `0.85` | 4B 기준. 2B는 0.78 |
 | | `max_model_len` | `2048` | 4B 기준. 2B는 8192 |
 | | `scheduling_policy` | `priority` | bbox 요청을 판단 요청보다 먼저 처리 |
-| | `extra_args` / `extra_env` | `""` / `{}` | `vllm serve`에 추가할 인자 / 환경변수 (예: 프로파일링, 아래 참고) |
+| | `extra_args` / `extra_env` | `"--linear-backend triton"` / `{}` | `vllm serve`에 추가할 인자 / 환경변수. 기본값은 진짜 FP8 W8A8 GEMM을 쓰게 합니다([FP8 W8A8](#fp8-w8a8---linear-backend-triton)). 프로파일링 인자도 여기에 넣습니다(아래 참고) |
 | preprocess | `max_side` | `448` | 서버로 보내는 프레임의 긴 변(px). 서버 쪽 메모리 계산과 이미지 크기 상한에도 같이 쓰임 |
 | inference | `strategy` | `two_stage` | `two_stage` \| `multi_image` \| `single_frame` |
 | | `judge_threshold` | `0.5` | 판단 점수 임계값 |
@@ -225,8 +225,10 @@ RTX 4060 8GB + Qwen3-VL-4B-FP8 기준, 4스트림 동시(RTSP 1 + MP4 3):
 | 500ms | 약 300ms | 2.5~4초 |
 | **1000ms (기본값)** | 200~300ms | **약 1.7초** |
 
-- **bbox 생성(약 44토큰)이 느린 게 병목입니다.** 디코딩 각 단계가 다른 스트림의 판단 요청과 같이 처리되기 때문입니다. 1스트림만 돌릴 때는 약 1초 걸립니다.
-- **GPU 메모리가 빠듯합니다.** 8GB 중 약 7.2GB를 쓰고 KV cache는 약 3,200토큰입니다. Windows 쪽에서 GPU를 많이 쓰면 serving 기동이 실패할 수 있습니다.
+위 표는 2026-11-18에 Marlin W8A16 커널로 측정했습니다. [FP8 W8A8](#fp8-w8a8---linear-backend-triton)로 바꾼 뒤(2026-11-23) 4스트림 수준의 `vllm bench serve`에서 judge p50은 0.8~1.0초 → 약 0.3초, bbox p50은 약 3.4 → 약 2.0초(p99 약 7.8 → 3.5~4.3초)로 줄었고, 정확도는 같습니다.
+
+- **bbox 생성(약 44토큰)이 느린 게 병목입니다.** 디코딩 각 단계가 다른 스트림의 판단 요청과 같이 처리되기 때문입니다. 1스트림만 돌릴 때는 약 1초 걸립니다. FP8 W8A8로 judge prefill이 짧아져 decode가 덜 기다리게 됐지만, decode 자체(메모리 대역폭 한계, 토큰당 약 24ms)는 빨라지지 않았습니다.
+- **GPU 메모리가 빠듯합니다.** 8GB 중 약 7.2GB를 쓰고 KV cache는 약 3,900토큰입니다(FP8 W8A8 적용 전 약 3,300). Windows 쪽에서 GPU를 많이 쓰면 serving 기동이 실패할 수 있습니다.
 - **화면의 bbox는 추론한 프레임 기준이라**, 움직이는 대상에서는 약 1초 뒤처져 보입니다. 이벤트 스냅샷은 그 프레임에 직접 그리므로 정확합니다.
 - **스냅샷 폴더 날짜는 컨테이너 시간대(UTC) 기준입니다.** UI의 시각은 브라우저 시간으로 표시됩니다.
 
@@ -412,7 +414,7 @@ backend와 같은 순서로 진행했습니다. 먼저 재시작 없이 py-spy�
 
    ```yaml
    serving:
-     extra_args: "--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/tmp/vllm_prof --profiler-config.torch_profiler_with_stack=false"
+     extra_args: "--linear-backend triton --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/tmp/vllm_prof --profiler-config.torch_profiler_with_stack=false"
    ```
 
    - `curl -X POST http://127.0.0.1:9000/start_profile`로 시작하고, 몇 초 뒤 `curl -X POST .../stop_profile`로 멈춥니다.
@@ -432,7 +434,7 @@ backend와 같은 순서로 진행했습니다. 먼저 재시작 없이 py-spy�
 
 - **GPU는 98% 사용 중이고 커널 효율도 좋습니다.**
   - 6초 동안 GPU가 쉰 가장 긴 구간이 6ms였습니다.
-  - FP8 GEMM(Marlin)이 GPU 시간의 43%입니다. judge prefill은 약 3.9 TFLOP을 약 112ms에 계산하는데(약 35 TFLOPS), RTX 4060의 bf16 성능 한계에 가깝습니다. 느린 커널이 아니라 연산량 자체가 큰 것입니다.
+  - FP8 GEMM(Marlin, [FP8 W8A8](#fp8-w8a8---linear-backend-triton) 적용 전)이 GPU 시간의 43%입니다. judge prefill은 약 3.9 TFLOP을 약 112ms에 계산하는데(약 35 TFLOPS), RTX 4060의 bf16 성능 한계에 가깝습니다. 느린 커널이 아니라 연산량 자체가 큰 것입니다.
   - 비전 인코더(bf16, CUDA graph 없음)는 약 14%입니다.
 - **vLLM API 서버는 98% 시간을 놀고 있습니다.** 연속된 요청이 같은 프레임을 공유해서 processor 캐시가 적중하므로, 이미지 디코딩과 HF processor 비용이 거의 없습니다.
 - **엔진 루프의 "멈춤"은 CPU가 바쁜 GPU를 기다리는 것입니다.**
@@ -491,6 +493,34 @@ python3 backend/examples/plot_latency_hist.py "1s:1 stream" "4s:4 streams" --met
   - bbox 출력 토큰 줄이기
   - `scheduling_policy` fcfs vs priority
 
+### FP8 W8A8 (`--linear-backend triton`)
+
+모델은 `Qwen3-VL-4B-Instruct-FP8`입니다(LLM 가중치 FP8 e4m3, 128x128 블록; 비전 인코더와 `lm_head`는 bf16). RTX 4060(Ada, sm_89)에는 FP8 텐서코어가 있는데도 vLLM v0.33은 `MarlinFP8ScaledMMLinearKernel`을 골랐고, "Your GPU does not have native support for FP8 computation" 경고를 남겼습니다. 이 커널은 가중치만 FP8인 방식(W8A16)이라, 가중치를 풀어서 bf16으로 곱합니다.
+- CUDA에서 블록 FP8 커널은 FlashInfer/DeepGEMM, CUTLASS block(sm_90 이상만), B12x, **Marlin**, Triton 순서로 시도합니다. sm_89에서는 Marlin이 Triton보다 앞에 있어서 Marlin이 선택됩니다.
+- `serving.extra_args: "--linear-backend triton"`으로 `TritonFp8BlockScaledMMKernel`을 쓰게 했습니다. 활성값을 토큰 그룹 단위로 FP8로 양자화하고 GEMM을 FP8 텐서코어에서 실행합니다(W8A8). 모델 파일은 그대로입니다.
+- INT8 W8A8도 Ada에서 텐서코어 속도는 비슷하지만, 다른 체크포인트가 필요하거나 직접 calibration해야 합니다. FP8 W8A8로 지금 모델 그대로 같은 이득을 얻을 수 있습니다.
+
+결과 (2026-11-23, `bench_vllm.sh`로 `vllm bench serve`, 각 60초. 두 설정 모두 같은 날 serving을 막 재시작한 상태에서 측정했고, 4스트림 부하는 두 번씩 실행):
+
+![end-to-end 지연 히스토그램, 4스트림, Marlin W8A16 vs Triton FP8 W8A8](images/latency_hist_fp8_e2e.svg)
+
+![첫 토큰까지 시간 히스토그램, 4스트림, Marlin W8A16 vs Triton FP8 W8A8](images/latency_hist_fp8_ttft.svg)
+
+| 부하 | 요청 | Marlin W8A16 (적용 전) p50 / p90 / p99 | Triton FP8 W8A8 (적용 후) p50 / p90 / p99 | 출력 토큰당 시간 |
+|---|---|---|---|---|
+| 1스트림 | judge e2e | 249 / 516 / 894ms | **198 / 497 / 691ms** | – |
+| | ground e2e | 1124 / 1357 / 1728ms | 1153 / 1289 / 1503ms | 23.6 → 24.2ms |
+| 4스트림, 1회차 | judge e2e | 1014 / 2793 / 3301ms | **290 / 840 / 2062ms** | – |
+| | ground e2e | 3379 / 5599 / 7908ms | **1931 / 3417 / 4274ms** | 60.9 → 41.8ms |
+| 4스트림, 2회차 | judge e2e | 804 / 1511 / 2133ms | **309 / 929 / 1316ms** | – |
+| | ground e2e | 3407 / 5560 / 7778ms | **1987 / 2995 / 3549ms** | 64.5 → 42.1ms |
+
+- **prefill이 빨라져서 4스트림 부하에서 요청이 덜 쌓입니다.** judge 단독은 약 20% 빨라졌습니다(p50 249 → 198ms). 4스트림에서는 judge p50이 약 3배(0.8~1.0초 → 약 0.3초), bbox 요청은 약 1.7배(p50 약 3.4 → 약 2.0초, p99 약 7.8 → 3.5~4.3초) 빨라졌습니다. 같은 엔진 스텝에서 함께 처리되는 judge prefill이 짧아졌기 때문입니다.
+- **decode 단독은 그대로입니다**(1스트림 토큰당 23.6 → 24.2ms). decode는 메모리 대역폭이 한계이고, 가중치는 원래 8비트였으므로 읽는 양이 같습니다.
+- **KV cache가 늘었습니다**: 3,280 → 3,872토큰 (가중치 5.85 → 5.79GiB. 나머지 차이의 원인은 확인하지 않았습니다).
+- **정확도는 그대로입니다**(`eval_strategies.py --strategies two_stage`, UR Fall 영상 4개): 정밀도 1.00, 재현율 0.85, F1 0.92, 오탐 0, 미검출 4로 같고, IoU는 0.98(이전 0.99)입니다. judge 점수는 평균 0.009 달라졌고, 음성 최대 점수는 0.048(이전 0.037)로 threshold 0.5보다 여전히 훨씬 낮습니다.
+- 여기서 측정한 4스트림 Marlin 기준선은 위의 2026-11-20 결과보다 나쁩니다(judge p50 0.8~1.0초 vs 502ms). 이 부하에서는 GPU가 거의 포화 상태라 실행마다 편차가 큽니다. 같은 날 측정한 결과끼리만 비교해야 합니다.
+
 ## 폴더 구조
 
 ```
@@ -499,6 +529,7 @@ realtime-vlm/
 ├── docker-compose.yml
 ├── build_docker.sh              # docker compose build
 ├── run_docker.sh                # docker compose up -d
+├── serving.conf                 # 예전 단일 컨테이너 구성의 supervisord 설정(entrypoint.sh 실행). docker compose에서는 쓰지 않음
 ├── configs/config.yaml          # 전체 설정
 ├── serving/
 │   ├── Dockerfile               # vllm/vllm-openai 기반
@@ -543,4 +574,6 @@ realtime-vlm/
 - [x] P4 웹 UI
 - [x] 컨테이너 분리 (serving / backend / frontend)
 - [ ] P5 안정화·튜닝: bbox 출력 토큰 줄이기, 4스트림 부하 측정
+  - [x] 프로파일링 (전체 시스템, vLLM 내부, `vllm bench serve`)
+  - [x] FP8 W8A8 GEMM (`--linear-backend triton`): 4스트림 judge 약 3배, bbox 약 1.7배 빨라짐, 정확도 동일
 - [ ] P6 Triton 서빙 비교
